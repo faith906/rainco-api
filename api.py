@@ -6,7 +6,7 @@ Run: python3 RainCo_Quote_Formatter.py
 Opens automatically in your browser at http://localhost:8742
 """
 
-import sys, os, io, json, threading, webbrowser, re, traceback, tempfile, urllib.request, urllib.parse
+import sys, os, io, json, threading, webbrowser, re, traceback, tempfile, urllib.request, urllib.parse, base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 8742
@@ -253,6 +253,73 @@ def get_product_image(name, sku):
     return None
 
 
+# ── PDF IMAGE EXTRACTION ──────────────────────────────────────────────────────
+def _extract_pdf_images(pdf_bytes):
+    """Extract product images embedded in the source PDF, keyed by SKU.
+    Matches each small square image to the nearest SKU line by y-position.
+    Returns {sku: base64_png_string}."""
+    from pdfminer.pdftypes import resolve1, PDFStream
+    from PIL import Image as PILImage
+    result = {}
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_h = page.height
+                resources = resolve1(page.page_obj.resources)
+                xobjects = resolve1(resources.get('XObject', {}))
+
+                # Collect product-sized images (30–200px square) with y midpoint
+                img_positions = {}
+                for img_meta in page.images:
+                    w, h = img_meta['width'], img_meta['height']
+                    if 30 <= w <= 200 and 30 <= h <= 200:
+                        # pdfplumber images use bottom-origin y; convert to top-origin
+                        y_top = page_h - img_meta['y1']
+                        y_bot = page_h - img_meta['y0']
+                        img_positions[img_meta['name']] = (y_top + y_bot) / 2
+
+                # Collect SKU y-positions
+                sku_positions = {}
+                lines = {}
+                for w in page.extract_words():
+                    y = round(w['top'])
+                    lines.setdefault(y, []).append(w['text'])
+                for y, tokens in lines.items():
+                    line = ' '.join(tokens)
+                    m = re.match(r'^SKU:\s*(\S+)', line)
+                    if m:
+                        sku_positions[m.group(1)] = y - 13  # approx product name y
+
+                # Match each SKU to the closest image
+                for sku, name_y in sku_positions.items():
+                    if not img_positions:
+                        continue
+                    best = min(img_positions, key=lambda n: abs(img_positions[n] - name_y))
+                    if abs(img_positions[best] - name_y) > 80:
+                        continue
+                    if best not in xobjects:
+                        continue
+                    xobj = resolve1(xobjects[best])
+                    if not isinstance(xobj, PDFStream):
+                        continue
+                    try:
+                        raw  = xobj.get_data()
+                        attrs = xobj.attrs
+                        iw   = int(attrs.get('Width', 0))
+                        ih   = int(attrs.get('Height', 0))
+                        if iw <= 0 or ih <= 0:
+                            continue
+                        img = PILImage.frombytes('RGB', (iw, ih), raw)
+                        buf = io.BytesIO()
+                        img.save(buf, format='PNG')
+                        result[sku] = base64.b64encode(buf.getvalue()).decode()
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f'  Image extraction error: {e}', flush=True)
+    return result
+
+
 # ── PDF PARSING ───────────────────────────────────────────────────────────────
 def parse_rainco_quote(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -363,6 +430,11 @@ def parse_rainco_quote(pdf_bytes):
     # Trade discount: look for "Trade Discount -$369" (the minus is before the $)
     dm = re.search(r'Trade\s*Discount\D{0,5}([\d,]+(?:\.\d+)?)', full_text, re.I)
     result['totals']['discount'] = float(dm.group(1).replace(',','')) if dm else 0
+
+    # Extract product images from the PDF itself (no web fetching needed)
+    print('  Extracting product images from PDF…', flush=True)
+    result['skuImages'] = _extract_pdf_images(pdf_bytes)
+    print(f'  Found {len(result["skuImages"])} product images', flush=True)
 
     return result
 
@@ -676,15 +748,25 @@ def generate_formatted_pdf(quote, rooms, room_qtys):
     GAP     = 4*mm                  # gap between 2-col cards
     CARD_W  = (CW - GAP) / 2
 
-    # ── Image fetch ──
-    all_items = quote['items']
-    qty_map   = {e['itemIndex']: e['qtys'] for e in room_qtys}
-    print('  Fetching product images…', flush=True)
-    img_paths = {}
+    # ── Images — use those extracted from the source PDF ──
+    all_items    = quote['items']
+    qty_map      = {e['itemIndex']: e['qtys'] for e in room_qtys}
+    sku_images   = quote.get('skuImages', {})
+    img_paths    = {}
+    _tmp_imgs    = []   # track temp files to clean up
     for item in all_items:
-        path = get_product_image(item['name'], item['sku'])
-        img_paths[item['sku']] = path
-        print(f'    {item["sku"]}: {"✓" if path else "✗"}', flush=True)
+        sku = item['sku']
+        if sku in sku_images:
+            try:
+                img_data = base64.b64decode(sku_images[sku])
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
+                tmp.write(img_data); tmp.close()
+                img_paths[sku] = tmp.name
+                _tmp_imgs.append(tmp.name)
+            except Exception:
+                img_paths[sku] = None
+        else:
+            img_paths[sku] = None
 
     def room_entries(room):
         out = []
@@ -831,6 +913,12 @@ def generate_formatted_pdf(quote, rooms, room_qtys):
                      alignment=1)))
 
     doc.build(story)
+
+    # Clean up temp image files
+    for p in _tmp_imgs:
+        try: os.unlink(p)
+        except Exception: pass
+
     return buf.getvalue()
 
 
