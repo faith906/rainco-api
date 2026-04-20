@@ -445,9 +445,14 @@ def _parse_items(table_lines):
                 else:
                     name_parts = list(pre_b)
 
-        # Append the B-line name prefix if present
+        # If b_prefix is a standalone price (e.g. "$45"), use it as the unit
+        # price rather than appending it to the product name.
         if b_prefix:
-            name_parts.append(b_prefix)
+            lone_p = re.match(r'^\$?([\d,]+(?:\.\d+)?)\s*$', b_prefix)
+            if lone_p and orig_p is None:
+                orig_p = float(lone_p.group(1).replace(',', ''))
+            else:
+                name_parts.append(b_prefix)
 
         name = ' '.join(name_parts).strip()
 
@@ -727,7 +732,7 @@ def generate_formatted_pdf(quote, rooms, room_qtys):
 
     # ── Room sections ──
     assigned_rooms = [r for r in rooms if room_entries(r)]
-    unassigned = [(item, 1, item['total']) for idx, item in enumerate(all_items)
+    unassigned = [(item, item['qty'], item['total']) for idx, item in enumerate(all_items)
                   if all(qty_map.get(idx, {}).get(r, 0) == 0 for r in rooms)]
     sections = [(r, room_entries(r)) for r in assigned_rooms]
     if unassigned:
