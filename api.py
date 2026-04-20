@@ -277,40 +277,63 @@ def parse_rainco_quote(pdf_bytes):
         if dm: result['quoteDate'] = l
 
     def _dedup_line(line):
-        """The PDF duplicates column data side-by-side. Extract just the first occurrence."""
+        """The PDF duplicates column data side-by-side — extract just one occurrence.
+        Left column = Shipping Address, Right column = Customer. We want the right (customer) side."""
         words = line.split()
         n = len(words)
         if n == 0:
             return line
-        # Try splitting in half — if both halves are equal it's a duplicate column
+        # Try exact-half duplication — if both halves match, names are the same, return either
         for half in range(1, n // 2 + 1):
             if words[:half] == words[half:half*2]:
                 return ' '.join(words[:half])
-        # Fallback: take first half by count
-        return ' '.join(words[:max(1, n // 2)])
+        # No duplication — short line is a single value, return as-is
+        if n <= 3:
+            return line
+        # Two different columns: shipping (left) vs customer (right). Take right (customer) side.
+        return ' '.join(words[n // 2:])
 
+    def _extract_customer(start_i):
+        """Extract customer name + company from lines starting at start_i."""
+        if start_i + 1 < len(lines):
+            result['customerName'] = _dedup_line(lines[start_i + 1])
+        for j in range(start_i + 2, min(start_i + 10, len(lines))):
+            ln = lines[j]
+            if re.match(r'ITEMS\b.*PRICE\b', ln, re.I):
+                break
+            if re.match(r'SHIPPING METHOD|PAYMENT|^\d+\s|^Australia\b|^Standard\b|Tel\.|^\+61', ln, re.I):
+                continue
+            candidate = _dedup_line(ln)
+            if not candidate or not re.match(r'^[A-Za-z]', candidate):
+                continue
+            if result['customerName'] and candidate.lower() == result['customerName'].lower():
+                continue
+            result['customerCompany'] = candidate
+            break
+
+    # Strategy 1: headers on same line ("SHIPPING ADDRESS ... CUSTOMER ...")
     for i, l in enumerate(lines):
         if 'SHIPPING ADDRESS' in l and 'CUSTOMER' in l:
-            if i+1 < len(lines):
-                result['customerName'] = _dedup_line(lines[i+1])
-            # Scan the next few lines for a company name (skipping separators/address lines)
-            for j in range(i+2, min(i+8, len(lines))):
-                ln = lines[j]
-                # Hard stop: we've hit the items table
-                if re.match(r'ITEMS\b.*PRICE\b', ln, re.I):
-                    break
-                # Skip known non-company lines
-                if re.match(r'SHIPPING METHOD|^\d+\s|^Australia\b|^Standard\b|Tel\.|^\+61', ln, re.I):
-                    continue
-                candidate = _dedup_line(ln)
-                if not candidate or not re.match(r'^[A-Za-z]', candidate):
-                    continue
-                # Don't confuse with a repeated customer name
-                if candidate.lower() == result['customerName'].lower():
-                    continue
-                result['customerCompany'] = candidate
-                break
+            _extract_customer(i)
             break
+
+    # Strategy 2: "CUSTOMER" as its own line (some quote formats)
+    if not result['customerName']:
+        for i, l in enumerate(lines):
+            if re.match(r'^CUSTOMER\s*$', l.strip(), re.I):
+                _extract_customer(i)
+                break
+
+    # Strategy 3: name appears just after the date line
+    if not result['customerName']:
+        date_idx = next((i for i, l in enumerate(lines)
+                         if re.match(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d+,?\s*\d{4}', l)), -1)
+        if date_idx >= 0:
+            for j in range(date_idx + 1, min(date_idx + 6, len(lines))):
+                candidate = lines[j].strip()
+                if candidate and re.match(r'^[A-Z][a-z]', candidate) and '$' not in candidate:
+                    result['customerName'] = candidate
+                    break
 
     hi = next((i for i,l in enumerate(lines) if 'ITEMS' in l and 'ITEM TOTAL' in l), -1)
     fi = next((i for i,l in enumerate(lines) if re.match(r'^Subtotal', l, re.I)), -1)
@@ -1032,7 +1055,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Health check for Render
         if self.path in ('/', '/health'):
             body = b'{"status":"ok"}'
             self.send_response(200)
